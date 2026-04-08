@@ -1,2 +1,7 @@
 /.venv
 /output
+/~
+/slr/asl-signs
+/slr/checkpoints
+/slr/__pycache__
+/pose_extract/__pycache__
