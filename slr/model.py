@@ -52,13 +52,29 @@ class SLRModel(nn.Module):
 
     # --- Building Blocks ---
 
+    class TransposedConvLayer(nn.Module):
+        """Internal helper to bridge Conv1d (channel-first) and LayerNorm (channel-last)"""
+        def __init__(self, dim, kernel):
+            super().__init__()
+            self.conv = nn.Conv1d(dim, dim, kernel, padding=kernel // 2, groups=dim)
+            self.norm = nn.LayerNorm(dim)
+            self.act = nn.GELU()
+
+        def forward(self, x):
+            # x is (B, T, C)
+            # Conv layer filters across the last dimension and we want it to be time T
+            x = self.conv(x.transpose(1, 2)).transpose(1, 2)
+            return self.act(self.norm(x))
+
     def _make_conv_block(self, dim, kernel, layers):
-        convs = []
-        for i in range(layers):
-            convs.append(nn.Conv1d(dim, dim, kernel, padding=kernel//2, groups=dim))
-            convs.append(nn.LayerNorm(dim))
-            convs.append(nn.GELU())
-        return nn.Sequential(*convs)
+        """
+        Returns a block containing 'layers' number of depthwise convs.
+        Each matches the DepthwiseConvBlock behavior: (B, T, C) -> (B, T, C)
+        """
+        blocks = []
+        for _ in range(layers):
+            blocks.append(self.TransposedConvLayer(dim, kernel))
+        return nn.Sequential(*blocks)
 
     def _make_embed_block(self, in_dim, out_dim, dropout, not_last):
         layers = [nn.Linear(in_dim, out_dim), nn.LayerNorm(out_dim)]
@@ -70,11 +86,9 @@ class SLRModel(nn.Module):
 
     def run_stage1(self, x):
         # x: (B, T, D) -> Conv1d needs (B, D, T)
-        # Conv layer filters across the last dimension and we want it to be time T
-        x = x.transpose(1, 2)
         for block in self.stage1_blocks:
             x = x + block(x) # residuals
-        return x.transpose(1, 2)
+        return x
 
     def run_stage2(self, x):
         residual = self.stage2_residual_proj(x)
@@ -84,10 +98,9 @@ class SLRModel(nn.Module):
         return out + residual # residual projection across all of Stage 2
 
     def run_stage3(self, x):
-        x = x.transpose(1, 2)
         for block in self.stage3_blocks:
             x = x + block(x) # residuals
-        return x.transpose(1, 2)
+        return x
 
     # --- Positional Encoding ---
     # Taken from https://github.com/wzlxjtu/PositionalEncoding2D/blob/master/positionalembedding2d.py
@@ -116,7 +129,7 @@ class SLRModel(nn.Module):
         s1 = self.run_stage1(x)
         
         # Stage 2: Spatial frame embedding
-        s2 = self.run_stage2(s1, s1)
+        s2 = self.run_stage2(s1)
         
         # Stage 3: Local motion/position refinement
         s3 = self.run_stage3(s2)
