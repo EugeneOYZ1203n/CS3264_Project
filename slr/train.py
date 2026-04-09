@@ -37,14 +37,18 @@ def compute_f1(all_preds, all_labels):
 # One epoch of training
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device, epoch, max_epochs):
     model.train()
     total_loss = 0.0
     all_preds, all_labels = [], []
 
-    # Configure the loading bar
-    # ncols=100 keeps the bar a consistent width
-    pbar = tqdm(loader, desc="🚀 Training", unit="batch", ncols=100)
+    pbar = tqdm(
+        loader,
+        desc=f"  Epoch {epoch:3d}/{max_epochs-1} [train]",
+        unit="batch",
+        ncols=110,
+        leave=False,   # clears when done so the outer epoch bar stays on screen
+    )
 
     for sequences, padding_mask, labels in pbar:
         sequences    = sequences.to(device)
@@ -55,28 +59,19 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         logits = model(sequences, padding_mask=padding_mask)
         loss   = criterion(logits, labels)
         loss.backward()
-        
-        # Gradient clipping is vital for the Attention/Transformer stage 
-        # you described to prevent exploding gradients.
+        # Gradient clipping prevents exploding gradients in the attention stage
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # Statistics
-        batch_loss = loss.item()
+        batch_loss  = loss.item()
         total_loss += batch_loss * len(labels)
-        
         all_preds.extend(logits.argmax(dim=1).cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
 
-        # Update the loading bar postfix with the current loss
-        pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
+        pbar.set_postfix(loss=f"{batch_loss:.4f}")
 
     avg_loss = total_loss / len(loader.dataset)
     f1       = compute_f1(all_preds, all_labels)
-    
-    # Optional: Print final epoch stats after the bar finishes
-    print(f" -> Epoch Complete | Loss: {avg_loss:.4f} | F1: {f1:.4f}")
-    
     return avg_loss, f1
 
 
@@ -85,12 +80,20 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, epoch, max_epochs):
     model.eval()
     total_loss = 0.0
     all_preds, all_labels = [], []
 
-    for sequences, padding_mask, labels in loader:
+    pbar = tqdm(
+        loader,
+        desc=f"  Epoch {epoch:3d}/{max_epochs-1} [val]  ",
+        unit="batch",
+        ncols=110,
+        leave=False,
+    )
+
+    for sequences, padding_mask, labels in pbar:
         sequences    = sequences.to(device)
         padding_mask = padding_mask.to(device)
         labels       = labels.to(device)
@@ -98,9 +101,12 @@ def validate(model, loader, criterion, device):
         logits = model(sequences, padding_mask=padding_mask)
         loss   = criterion(logits, labels)
 
-        total_loss += loss.item() * len(labels)
+        batch_loss  = loss.item()
+        total_loss += batch_loss * len(labels)
         all_preds.extend(logits.argmax(dim=1).cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
+
+        pbar.set_postfix(loss=f"{batch_loss:.4f}")
 
     avg_loss = total_loss / len(loader.dataset)
     f1       = compute_f1(all_preds, all_labels)
@@ -112,21 +118,21 @@ def validate(model, loader, criterion, device):
 # ---------------------------------------------------------------------------
 
 def train(
-    data_root:     str,
-    save_dir:      str,
-    resume:        bool  = False,
-    max_epochs:    int   = 50,
-    batch_size:    int   = 64,
-    lr:            float = 3e-4,
-    max_seq_len:   int   = None,
-    num_workers:   int   = 4,
-    embedding_dim: int   = 192,
-    num_attn_layers: int = 4,
-    num_attn_heads:  int = 8,
-    dropout:       float = 0.1,
+    data_root:       str,
+    save_dir:        str,
+    resume:          bool  = False,
+    max_epochs:      int   = 50,
+    batch_size:      int   = 64,
+    lr:              float = 3e-4,
+    max_seq_len:     int   = None,
+    num_workers:     int   = 4,
+    embedding_dim:   int   = 192,
+    num_attn_layers: int   = 4,
+    num_attn_heads:  int   = 8,
+    dropout:         float = 0.1,
 ):
     print(f"Is CUDA available? {torch.cuda.is_available()}")
-    print(f"Device Name: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}")
+    print(f"Device Name      : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*60}")
     print(f"  Device      : {device}")
@@ -155,35 +161,45 @@ def train(
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model params: {total_params:,}\n")
+    print(f"  Model params : {total_params:,}\n")
 
     # ---- Optimisation ----------------------------------------------------
-    optimizer  = build_optimizer(model, lr=lr)
-    scheduler  = build_schedulers(optimizer)
-    criterion  = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = build_optimizer(model, lr=lr)
+    scheduler = build_schedulers(optimizer)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     # ---- Checkpointing & early stopping ----------------------------------
     ckpt = CheckpointManager(save_dir, metric_name="val_f1")
-    es   = EarlyStopping(patience=20, mode="max")   # paper: patience=20 on val loss
+    es   = EarlyStopping(patience=20, mode="max")
 
     start_epoch = 0
     best_val_f1 = 0.0
 
     if resume and ckpt.has_checkpoint("latest"):
         start_epoch, best_val_f1 = ckpt.load_latest(model, optimizer, scheduler, device)
-        es_val = ckpt.best_metric() or 0.0
-        # Restore early stopping state to the best known metric
-        es.best = es_val
+        es.best = ckpt.best_metric() or 0.0
         print(f"  Resuming from epoch {start_epoch}, best val_f1={best_val_f1:.4f}\n")
     elif resume:
         print("  No checkpoint found — starting fresh.\n")
 
-    # ---- Training loop ---------------------------------------------------
-    for epoch in range(start_epoch, max_epochs):
+    # ---- Outer epoch progress bar ----------------------------------------
+    # This bar persists for the full run and shows overall progress at a glance.
+    epoch_bar = tqdm(
+        range(start_epoch, max_epochs),
+        desc="  Overall progress",
+        unit="epoch",
+        ncols=110,
+    )
+
+    for epoch in epoch_bar:
         t0 = time.time()
 
-        train_loss, train_f1 = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss,   val_f1   = validate(model, val_loader, criterion, device)
+        train_loss, train_f1 = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, epoch, max_epochs
+        )
+        val_loss, val_f1 = validate(
+            model, val_loader, criterion, device, epoch, max_epochs
+        )
 
         elapsed = time.time() - t0
 
@@ -198,25 +214,44 @@ def train(
         ckpt.save(
             epoch, model, optimizer, scheduler, val_f1,
             is_best=is_best,
-            extra={"train_loss": train_loss, "train_f1": train_f1,
-                   "val_loss": val_loss, "lr": optimizer.param_groups[0]["lr"]},
+            extra={
+                "train_loss": train_loss, "train_f1": train_f1,
+                "val_loss":   val_loss,
+                "lr":         optimizer.param_groups[0]["lr"],
+            },
         )
 
-        print(
+        # Keep the outer bar's postfix up to date
+        epoch_bar.set_postfix(
+            train_f1=f"{train_f1:.4f}",
+            val_f1=f"{val_f1:.4f}",
+            best=f"{best_val_f1:.4f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.1e}",
+            secs=f"{elapsed:.0f}s",
+        )
+
+        # tqdm.write prints a line that stays in the scroll-back buffer,
+        # without mangling the live progress bars.
+        star = " ★" if is_best else ""
+        tqdm.write(
             f"  Epoch {epoch:3d}/{max_epochs-1} | "
             f"train loss={train_loss:.4f} f1={train_f1:.4f} | "
             f"val loss={val_loss:.4f} f1={val_f1:.4f} | "
-            f"lr={optimizer.param_groups[0]['lr']:.2e} | "
-            f"{elapsed:.1f}s"
+            f"lr={optimizer.param_groups[0]['lr']:.1e} | "
+            f"{elapsed:.1f}s{star}"
         )
 
-        # Early stopping (monitored on val F1)
+        # Early stopping
         if es.step(val_f1):
-            print(f"\n  Early stopping triggered after {epoch+1} epochs (patience={es.patience}).")
+            tqdm.write(
+                f"\n  Early stopping triggered after {epoch+1} epochs "
+                f"(patience={es.patience})."
+            )
             break
 
-    print(f"\n  Training complete. Best val_f1 = {best_val_f1:.4f}")
-    print(f"  Best checkpoint saved to: {Path(save_dir) / 'best.pt'}\n")
+    epoch_bar.close()
+    tqdm.write(f"\n  Training complete. Best val_f1 = {best_val_f1:.4f}")
+    tqdm.write(f"  Best checkpoint : {Path(save_dir) / 'best.pt'}\n")
     return model, best_val_f1
 
 
@@ -226,9 +261,9 @@ def train(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the SLR model on Google ASL")
-    parser.add_argument("--data_root",       required=True,        help="Path to the Kaggle dataset root")
+    parser.add_argument("--data_root",       required=True,       help="Path to the Kaggle dataset root")
     parser.add_argument("--save_dir",        default="checkpoints/google_asl")
-    parser.add_argument("--resume",          action="store_true",  help="Resume from latest checkpoint")
+    parser.add_argument("--resume",          action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--max_epochs",      type=int,   default=50)
     parser.add_argument("--batch_size",      type=int,   default=64)
     parser.add_argument("--lr",              type=float, default=3e-4)
