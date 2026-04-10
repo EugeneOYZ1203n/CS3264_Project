@@ -1,3 +1,9 @@
+Download from Kaggle at https://www.kaggle.com/competitions/asl-signs/data?select=train_landmark_files
+
+Extract npy files
+```python .\extract_to_npy.py```
+
+
 Base model
 ```python train.py --data_root ./asl-signs --save_dir checkpoints/google_asl_base --scheduler reduceonplateau```
 
