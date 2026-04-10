@@ -1,17 +1,21 @@
 """
 data_google_asl.py  —  DataLoader for the Google ASL Kaggle dataset
 ====================================================================
-Parquet schema (long format):
-    frame | row_id | type | landmark_index | x | y | z
+Supports two loading modes:
 
-One row per landmark per frame.
-`type` ∈ {'face', 'pose', 'left_hand', 'right_hand'}
+  1. Fast (.npy) — pre-extracted numpy files, ~10x faster than parquet.
+     Run extract_to_npy.py once to generate them, then pass npy_dir.
 
-We select the same 67 keypoints described in the paper and apply
-the shared preprocess pipeline (interpolate → normalise).
+  2. On-the-fly (parquet) — reads directly from the Kaggle parquet files.
+     Slower but requires no pre-processing step.
 
 Usage:
-    train_loader, val_loader, num_classes = get_dataloaders("./asl-signs")
+    # Fast mode (after running extract_to_npy.py)
+    train_loader, val_loader, n = get_dataloaders("./asl-signs",
+                                                   npy_dir="./asl-signs/train_landmarks_npy")
+
+    # On-the-fly mode
+    train_loader, val_loader, n = get_dataloaders("./asl-signs")
 """
 
 import json
@@ -24,36 +28,26 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-from preprocess import (
-    preprocess, INPUT_DIM,
-    N_HAND_KP, N_POSE_KP, POSE_INDICES,
-)
+from preprocess import preprocess, INPUT_DIM, N_HAND_KP, N_POSE_KP, POSE_INDICES
 
 
 # ---------------------------------------------------------------------------
 # Keypoint extraction  (long-format parquet → (T, 134) array)
+# Only used in on-the-fly mode or during npy pre-extraction.
 # ---------------------------------------------------------------------------
 
 def extract_keypoints(df: pd.DataFrame) -> np.ndarray:
     """
     Extract (T, 134) from a long-format Google ASL parquet DataFrame.
-
-    Selects:
-        left_hand  landmarks 0-20   → 21 kp
-        right_hand landmarks 0-20   → 21 kp
-        pose       landmarks 11-35  → first 25 of POSE_INDICES
-    Keeps x, y only (drops z).
     Returns NaN where a landmark was absent in a frame.
     """
     frames = sorted(df["frame"].unique())
 
     def _pivot(lm_type: str, lm_indices: list) -> np.ndarray:
-        """Returns (T, len(lm_indices), 2), NaN where absent."""
         sub = df[(df["type"] == lm_type) & (df["landmark_index"].isin(lm_indices))]
         if sub.empty:
             return np.full((len(frames), len(lm_indices), 2), np.nan, dtype=np.float32)
 
-        # Map original landmark_index → position in our selection
         idx_map = {orig: pos for pos, orig in enumerate(lm_indices)}
         sub = sub.copy()
         sub["sel_idx"] = sub["landmark_index"].map(idx_map)
@@ -67,13 +61,12 @@ def extract_keypoints(df: pd.DataFrame) -> np.ndarray:
 
         return np.stack([px.values, py.values], axis=-1).astype(np.float32)
 
-    lhand = _pivot("left_hand",  list(range(N_HAND_KP)))   # (T, 21, 2)
-    rhand = _pivot("right_hand", list(range(N_HAND_KP)))   # (T, 21, 2)
-    pose  = _pivot("pose",       POSE_INDICES)              # (T, 25, 2)
+    lhand = _pivot("left_hand",  list(range(N_HAND_KP)))
+    rhand = _pivot("right_hand", list(range(N_HAND_KP)))
+    pose  = _pivot("pose",       POSE_INDICES)
 
-    T   = len(frames)
     kps = np.concatenate([lhand, rhand, pose], axis=1)     # (T, 67, 2)
-    return kps.reshape(T, INPUT_DIM).astype(np.float32)    # (T, 134)
+    return kps.reshape(len(frames), INPUT_DIM).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -82,15 +75,15 @@ def extract_keypoints(df: pd.DataFrame) -> np.ndarray:
 
 class GoogleASLDataset(Dataset):
     """
-    Signer-independent split: no signer appears in both train and val.
-
     Args:
         data_root    : path to the unzipped Kaggle asl-signs directory
         split        : 'train' | 'val' | 'all'
-        val_fraction : fraction of signers held out for val
+        val_fraction : fraction of signers held out for val (signer-independent)
         max_seq_len  : truncate sequences longer than this (None = no limit)
-        label_map    : sign→int dict; built from sign_to_prediction_index_map.json
-                       if not provided
+        label_map    : sign→int dict; built automatically if not provided
+        augment      : apply train augmentations (True for train, False for val)
+        npy_dir      : if set, load pre-extracted .npy files from this directory
+                       instead of reading parquet files on the fly
         seed         : RNG seed for the signer split
     """
 
@@ -101,11 +94,13 @@ class GoogleASLDataset(Dataset):
         val_fraction: float = 0.15,
         max_seq_len: Optional[int] = None,
         label_map: Optional[dict] = None,
+        npy_dir: Optional[str] = None,
         seed: int = 42,
     ):
         assert split in ("train", "val", "all")
         self.data_root   = Path(data_root)
         self.max_seq_len = max_seq_len
+        self.npy_dir     = Path(npy_dir) if npy_dir else None
 
         meta = pd.read_csv(self.data_root / "train.csv")
 
@@ -124,10 +119,10 @@ class GoogleASLDataset(Dataset):
         self.num_classes = len(self.label_map)
 
         # Signer-independent split
-        rng        = np.random.default_rng(seed)
-        signers    = meta["participant_id"].unique()
+        rng         = np.random.default_rng(seed)
+        signers     = meta["participant_id"].unique()
         rng.shuffle(signers)
-        n_val      = max(1, int(len(signers) * val_fraction))
+        n_val       = max(1, int(len(signers) * val_fraction))
         val_signers = set(signers[:n_val])
 
         if split == "train":
@@ -136,10 +131,13 @@ class GoogleASLDataset(Dataset):
             meta = meta[meta["participant_id"].isin(val_signers)]
 
         self.meta = meta.reset_index(drop=True)
+
+        mode = "npy" if self.npy_dir else "parquet"
         print(
             f"[GoogleASL] {split:5s} | samples={len(self.meta):,} | "
             f"signers={self.meta['participant_id'].nunique()} | "
-            f"classes={self.num_classes}"
+            f"classes={self.num_classes} | "
+            f"mode={mode}"
         )
 
     def __len__(self):
@@ -149,12 +147,18 @@ class GoogleASLDataset(Dataset):
         row   = self.meta.iloc[idx]
         label = self.label_map[row["sign"]]
 
-        # Windows-safe path join (train.csv uses forward slashes on all OSes)
-        parquet_path = self.data_root / Path(*row["path"].split("/"))
-        df  = pd.read_parquet(parquet_path)
-        seq = extract_keypoints(df)          # (T, 134), may have NaNs
-        seq = preprocess(seq)                # interpolate + normalise
+        # --- Load keypoints ---
+        if self.npy_dir is not None:
+            # Fast path: pre-extracted numpy file
+            seq = np.load(self.npy_dir / f"{row['sequence_id']}.npy")
+        else:
+            # Slow path: read and parse parquet on the fly
+            parquet_path = self.data_root / Path(*row["path"].split("/"))
+            df  = pd.read_parquet(parquet_path)
+            seq = extract_keypoints(df)   # (T, 134), may have NaNs
+            seq = preprocess(seq)         # interpolate missing frames
 
+        # --- Truncate ---
         if self.max_seq_len and len(seq) > self.max_seq_len:
             seq = seq[:self.max_seq_len]
 
@@ -171,8 +175,8 @@ def collate_fn(batch):
     padded   = pad_sequence(sequences, batch_first=True, padding_value=0.0)
     T_max    = padded.shape[1]
     pad_mask = torch.zeros(len(sequences), T_max, dtype=torch.bool)
-    for i, l in enumerate(lengths):
-        pad_mask[i, l:] = True      # True = padding (ignored in attention)
+    for i, length in enumerate(lengths):
+        pad_mask[i, length:] = True   # True = padding (ignored in attention)
     return padded, pad_mask, torch.stack(labels)
 
 
@@ -182,15 +186,24 @@ def get_dataloaders(
     val_fraction: float = 0.15,
     max_seq_len: Optional[int] = None,
     num_workers: int = 4,
+    npy_dir: Optional[str] = None,
     seed: int = 42,
 ):
-    train_ds = GoogleASLDataset(data_root, "train", val_fraction, max_seq_len, seed=seed)
-    val_ds   = GoogleASLDataset(data_root, "val",   val_fraction, max_seq_len,
-                                label_map=train_ds.label_map, seed=seed)
+    train_ds = GoogleASLDataset(
+        data_root, "train", val_fraction, max_seq_len, npy_dir=npy_dir, seed=seed,
+    )
+    val_ds = GoogleASLDataset(
+        data_root, "val", val_fraction, max_seq_len,
+        label_map=train_ds.label_map, npy_dir=npy_dir, seed=seed,
+    )
 
-    train_loader = DataLoader(train_ds, batch_size, shuffle=True,
-                              collate_fn=collate_fn, num_workers=num_workers, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size, shuffle=False,
-                              collate_fn=collate_fn, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
+    )
 
     return train_loader, val_loader, train_ds.num_classes

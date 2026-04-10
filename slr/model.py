@@ -11,17 +11,29 @@ class SLRModel(nn.Module):
         num_classes=250,
         n_heads=8, 
         n_attn_layers=4, 
-        dropout=0.1
+        dropout=0.1,
+        stochastic_drop_start_prob = 1.0,
+        stochastic_drop_end_prob = 1.0
     ):
         super().__init__()
 
+        total_residual_layers = 4 + 4
+
+        probs = torch.linspace(
+            stochastic_drop_start_prob, 
+            stochastic_drop_end_prob, 
+            total_residual_layers
+        ).tolist()
+
         # --- Stage 1 & 3: Temporal Convolutions ---
+        s1_probs = probs[:4]
         self.stage1_blocks = nn.ModuleList([
-            self._make_conv_block(input_dim, k, layers=1) for k in [3, 5, 7, 9]
+            self._make_conv_block(input_dim, k, layers=1, keep_prob=s1_probs[i]) for i, k in enumerate([3, 5, 7, 9])
         ])
         
+        s3_probs = probs[4:8]
         self.stage3_blocks = nn.ModuleList([
-            self._make_conv_block(embed_dim, k, layers=2) for k in [3, 5, 7, 9]
+            self._make_conv_block(embed_dim, k, layers=2, keep_prob=s3_probs[i]) for i, k in enumerate([3, 5, 7, 9])
         ])
 
         # --- Stage 2: Frame Embedder ---
@@ -65,8 +77,31 @@ class SLRModel(nn.Module):
             # Conv layer filters across the last dimension and we want it to be time T
             x = self.conv(x.transpose(1, 2)).transpose(1, 2)
             return self.act(self.norm(x))
+    
+    # Based on this repo https://github.com/FrancescoSaverioZuppichini/DropPath
+    class DropPath(nn.Module):
+        def __init__(self, p: float = 0.5, inplace: bool = False):
+            super().__init__()
+            self.p = p
+            self.inplace = inplace
 
-    def _make_conv_block(self, dim, kernel, layers):
+        def drop_path(self, x, keep_prob: float = 1.0, inplace: bool = False):
+            mask_shape = (x.shape[0],) + (1,) * (x.ndim - 1) 
+            # remember tuples have the * operator -> (1,) * 3 = (1,1,1)
+            mask = x.new_empty(mask_shape).bernoulli_(keep_prob)
+            mask.div_(keep_prob)
+            if inplace:
+                x.mul_(mask)
+            else:
+                x = x * mask
+            return x
+
+        def forward(self, x):
+            if self.training and self.p > 0:
+                x = self.drop_path(x, self.p, self.inplace)
+            return x
+
+    def _make_conv_block(self, dim, kernel, layers, keep_prob = 1.0):
         """
         Returns a block containing 'layers' number of depthwise convs.
         Each matches the DepthwiseConvBlock behavior: (B, T, C) -> (B, T, C)
@@ -74,6 +109,8 @@ class SLRModel(nn.Module):
         blocks = []
         for _ in range(layers):
             blocks.append(self.TransposedConvLayer(dim, kernel))
+        if keep_prob != 1.0:
+            blocks.append(self.DropPath(p = keep_prob))
         return nn.Sequential(*blocks)
 
     def _make_embed_block(self, in_dim, out_dim, dropout, not_last):
