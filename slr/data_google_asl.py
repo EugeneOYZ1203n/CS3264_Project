@@ -89,15 +89,17 @@ class GoogleASLDataset(Dataset):
 
     def __init__(
         self,
-        data_root: str,
+        data_root: str = "./asl-signs",
         split: str = "train",
         val_fraction: float = 0.15,
         max_seq_len: Optional[int] = None,
         label_map: Optional[dict] = None,
         npy_dir: Optional[str] = None,
+        augmentor=None,
         seed: int = 42,
     ):
         assert split in ("train", "val", "all")
+        self.augmentor = augmentor
         self.data_root   = Path(data_root)
         self.max_seq_len = max_seq_len
         self.npy_dir     = Path(npy_dir) if npy_dir else None
@@ -158,6 +160,9 @@ class GoogleASLDataset(Dataset):
             seq = extract_keypoints(df)   # (T, 134), may have NaNs
             seq = preprocess(seq)         # interpolate missing frames
 
+        if self.augmentor is not None:
+            seq = self.augmentor(seq)
+
         # --- Truncate ---
         if self.max_seq_len and len(seq) > self.max_seq_len:
             seq = seq[:self.max_seq_len]
@@ -187,14 +192,15 @@ def get_dataloaders(
     max_seq_len: Optional[int] = None,
     num_workers: int = 4,
     npy_dir: Optional[str] = None,
+    augmentor = None,
     seed: int = 42,
 ):
     train_ds = GoogleASLDataset(
-        data_root, "train", val_fraction, max_seq_len, npy_dir=npy_dir, seed=seed,
+        data_root, "train", val_fraction, max_seq_len, npy_dir=npy_dir, seed=seed, augmentor=augmentor
     )
     val_ds = GoogleASLDataset(
         data_root, "val", val_fraction, max_seq_len,
-        label_map=train_ds.label_map, npy_dir=npy_dir, seed=seed,
+        label_map=train_ds.label_map, npy_dir=npy_dir, seed=seed, augmentor=augmentor
     )
 
     train_loader = DataLoader(

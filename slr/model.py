@@ -191,3 +191,25 @@ class SLRModel(nn.Module):
 
         # Stage 5: Classification
         return self.classifier(cls_final)
+    
+def load_backbone(model, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path)
+    state_dict = checkpoint['model_state_dict']
+    
+    # Filter out the classifier keys
+    backbone_dict = {k: v for k, v in state_dict.items() if "classifier" not in k}
+    
+    # Load what remains (strict=False allows missing classifier weights)
+    model.load_state_dict(backbone_dict, strict=False)
+    print(f"Loaded backbone. Classifier initialized fresh for {model.classifier.out_features} classes.")
+
+def freeze_backbone(model):
+    for name, param in model.named_parameters():
+        if "classifier" not in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True # Ensure the new head is trainable
+    
+    # Verification
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {trainable_params:,}")

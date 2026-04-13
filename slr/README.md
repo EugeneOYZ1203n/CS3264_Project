@@ -3,9 +3,11 @@ Download from Kaggle at https://www.kaggle.com/competitions/asl-signs/data?selec
 Extract npy files
 ```python .\extract_to_npy.py```
 
-
 Base model
 ```python train.py --data_root ./asl-signs --save_dir checkpoints/google_asl_base --scheduler reduceonplateau```
 
 Stoch Drop
 ```python train.py --data_root ./asl-signs --save_dir checkpoints/google_asl_stoch_drop --scheduler reduceonplateau --stoch_drop```
+
+SGSL Finetuning
+```python .\train.py --data sgsl --save_dir checkpoints/test --finetune_from checkpoints/google_asl_base```

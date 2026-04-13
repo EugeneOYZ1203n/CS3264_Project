@@ -16,8 +16,10 @@ from sklearn.metrics    import f1_score
 from tqdm import tqdm
 
 from model              import SLRModel
-from data_google_asl    import get_dataloaders
+import data_google_asl
+import data_sgsl
 from checkpoint_manager import CheckpointManager, EarlyStopping
+from data_augmentation import SignAugmentor
 
 
 # ---------------------------------------------------------------------------
@@ -67,18 +69,30 @@ def train(args):
 
     print(f"\n{'='*55}")
     print(f"  Device    : {device}")
-    print(f"  Data root : {args.data_root}")
+    print(f"  Data : {args.data}")
     print(f"  Save dir  : {args.save_dir}")
     print(f"{'='*55}\n")
 
-    # Data
-    train_loader, val_loader, num_classes = get_dataloaders(
-        args.data_root,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        max_seq_len=128,
-        npy_dir= f"{args.data_root}/train_landmarks_npy"
-    )
+    augmentor = SignAugmentor(flip_prob=0.5,rotate_std=0.05,keep_ratio=0.7)
+
+    match args.data:
+        case "sgsl":
+            train_loader, val_loader, num_classes = data_sgsl.get_dataloaders(
+                batch_size=args.batch_size,
+                max_seq_len=128,
+                num_workers=args.num_workers,
+                augmentor=augmentor
+            )
+        case "google_asl":
+            # Data
+            train_loader, val_loader, num_classes = data_google_asl.get_dataloaders(
+                data_root="./asl-signs",
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                max_seq_len=128,
+                npy_dir= "./asl-signs/train_landmarks_npy",
+                augmentor=augmentor
+            )
 
     # Model
     start_prob = 1.0
@@ -91,6 +105,10 @@ def train(args):
 
     # Optimiser + scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    #optimizer = torch.optim.Adam(
+    #    filter(lambda p: p.requires_grad, model.parameters()), 
+    #    lr=1e-3
+    #)
     steps_per_epoch = len(train_loader)
     total_steps = args.epochs * steps_per_epoch
     if args.scheduler == "onecyclelr":
@@ -115,10 +133,14 @@ def train(args):
         with open(log_path, "w") as f:
             f.write("epoch,train_loss,train_f1,val_loss,val_f1,lr\n")
 
+    
+    print(f"{'='*55}\n")
+
+
     start_epoch, best_f1 = 0, 0.0
     if args.resume and ckpt.has_checkpoint():
         start_epoch, best_f1 = ckpt.load_latest(model, optimizer, scheduler, device)
-        es.best = ckpt.best_metric() or 0.0
+        es.best = float("inf")
         print(f"  Resumed from epoch {start_epoch},  best val_f1={best_f1:.4f}\n")
 
     # ---- Training loop ---------------------------------------------------
@@ -212,12 +234,13 @@ def train(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root",   required=True)
-    p.add_argument("--save_dir",    default="checkpoints/google_asl")
-    p.add_argument("--resume",      action="store_true")
-    p.add_argument("--epochs",      type=int,   default=50)
-    p.add_argument("--batch_size",  type=int,   default=64)
-    p.add_argument("--num_workers", type=int,   default=4)
-    p.add_argument("--scheduler",   type=str,   default="reduceonplateau", choices=["onecyclelr", "reduceonplateau"])
-    p.add_argument("--stoch_drop",  action="store_true")
+    p.add_argument("--data",            required=True, choices=["sgsl", "google_asl"])
+    p.add_argument("--save_dir",        default="checkpoints/google_asl")
+    p.add_argument("--resume",          action="store_true")
+    p.add_argument("--finetune_from",   type=str, default=None, help="Path to prev checkpoint folder")
+    p.add_argument("--epochs",          type=int,   default=50)
+    p.add_argument("--batch_size",      type=int,   default=64)
+    p.add_argument("--num_workers",     type=int,   default=4)
+    p.add_argument("--scheduler",       type=str,   default="reduceonplateau", choices=["onecyclelr", "reduceonplateau"])
+    p.add_argument("--stoch_drop",      action="store_true")
     train(p.parse_args())
