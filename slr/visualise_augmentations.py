@@ -137,7 +137,7 @@ def visualise_sequence(npy_path: str, num_variations: int = 3, interval: int = 6
     data = np.load(npy_path)   # (T, 134)
     print(f"Loaded '{Path(npy_path).name}': {data.shape[0]} frames, {data.shape[1]} features")
 
-    augmentor = SignAugmentor(flip_prob=0.5, rotate_std=0.5, keep_ratio=0.7)
+    augmentor = SignAugmentor(flip_prob=0.5, rotate_std=0.2)
 
     # Generate augmented sequences up front
     sequences = [data]

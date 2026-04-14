@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn as nn
 
+from PoseFeatureExtractor import PoseFeatureExtractor
+
 class SLRModel(nn.Module):
     def __init__(
         self, 
@@ -24,6 +26,9 @@ class SLRModel(nn.Module):
             stochastic_drop_end_prob, 
             total_residual_layers
         ).tolist()
+
+        self.extractor = PoseFeatureExtractor()
+        input_dim += 4
 
         # --- Stage 1 & 3: Temporal Convolutions ---
         s1_probs = probs[:4]
@@ -160,8 +165,25 @@ class SLRModel(nn.Module):
         pe[:, 1::2] = torch.cos(position.float() * div_term)
 
         return pe
+    
+    def stage_params(self):
+        """
+        Returns an ordered dict mapping stage name → list of parameters.
+        Stage numbering matches the architecture description (1–5).
+        """
+        return {
+            "stage1": list(self.stage1_blocks.parameters()),
+            "stage2": list(self.stage2_blocks.parameters())
+                    + list(self.stage2_residual_proj.parameters()),
+            "stage3": list(self.stage3_blocks.parameters()),
+            "stage4": list(self.transformer.parameters())
+                    + [self.cls_token],
+            "stage5": list(self.classifier.parameters()),
+        }
 
     def forward(self, x, padding_mask=None):
+        x = self.extractor(x)
+
         # Stage 1: Temporal patterns per feature
         s1 = self.run_stage1(x)
         
@@ -192,24 +214,58 @@ class SLRModel(nn.Module):
         # Stage 5: Classification
         return self.classifier(cls_final)
     
-def load_backbone(model, checkpoint_path):
-    checkpoint = torch.load(checkpoint_path)
-    state_dict = checkpoint['model_state_dict']
-    
-    # Filter out the classifier keys
-    backbone_dict = {k: v for k, v in state_dict.items() if "classifier" not in k}
-    
-    # Load what remains (strict=False allows missing classifier weights)
-    model.load_state_dict(backbone_dict, strict=False)
-    print(f"Loaded backbone. Classifier initialized fresh for {model.classifier.out_features} classes.")
-
-def freeze_backbone(model):
-    for name, param in model.named_parameters():
-        if "classifier" not in name:
-            param.requires_grad = False
-        else:
-            param.requires_grad = True # Ensure the new head is trainable
-    
-    # Verification
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {trainable_params:,}")
+# Stage ordering — freeze_up_to=N freezes stages 1 … N
+_STAGE_ORDER = ["stage1", "stage2", "stage3", "stage4", "stage5"]
+ 
+ 
+def load_backbone(model: SLRModel, checkpoint_path: str, device="cpu"):
+    """
+    Load all weights from a checkpoint except the classifier head.
+    The new model can have a different num_classes.
+    """
+    ckpt       = torch.load(checkpoint_path, map_location=device)
+    state_dict = ckpt["model_state_dict"]
+    backbone   = {k: v for k, v in state_dict.items() if "classifier" not in k}
+    missing, unexpected = model.load_state_dict(backbone, strict=False)
+    print(f"  Backbone loaded from '{checkpoint_path}'")
+    if missing:
+        print(f"    Missing keys  : {missing}")
+    if unexpected:
+        print(f"    Unexpected    : {unexpected}")
+    print(f"  Classifier head ({model.classifier.out_features} classes) initialised fresh.")
+ 
+ 
+def freeze_stages(model: SLRModel, freeze_up_to: int):
+    """
+    Freeze stages 1 … freeze_up_to (inclusive), leave the rest trainable.
+ 
+    freeze_up_to=0 → nothing frozen (full fine-tune)
+    freeze_up_to=1 → stage 1 frozen
+    freeze_up_to=2 → stages 1-2 frozen
+    freeze_up_to=3 → stages 1-3 frozen
+    freeze_up_to=4 → stages 1-4 frozen  (only classifier trains)
+ 
+    Args:
+        model        : SLRModel instance
+        freeze_up_to : int 0-4
+    """
+    if not (0 <= freeze_up_to <= 4):
+        raise ValueError(f"freeze_up_to must be 0-4, got {freeze_up_to}")
+ 
+    groups = model.stage_params()
+ 
+    # First unfreeze everything so this is idempotent
+    for p in model.parameters():
+        p.requires_grad = True
+ 
+    frozen_stages = _STAGE_ORDER[:freeze_up_to]
+    for stage_name in frozen_stages:
+        for p in groups[stage_name]:
+            p.requires_grad = False
+ 
+    # Summary
+    frozen_count   = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_label   = f"stages 1-{freeze_up_to}" if freeze_up_to > 0 else "nothing"
+    print(f"  Frozen  : {frozen_label}  ({frozen_count:,} params)")
+    print(f"  Trainable: {trainable_count:,} params")

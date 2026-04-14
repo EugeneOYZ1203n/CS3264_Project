@@ -4,6 +4,9 @@ train.py  —  Simple training script for SLRModel
 Usage:
     python train.py --data_root ./asl-signs
     python train.py --data_root ./asl-signs --resume
+    python train.py --data sgsl --save_dir checkpoints/sgsl_ft
+                    --finetune_from checkpoints/google_asl
+                    --freeze_stages 2
 """
 
 import argparse
@@ -12,14 +15,17 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch_optimizer as optim_extra
 from sklearn.metrics    import f1_score
 from tqdm import tqdm
 
-from model              import SLRModel
+#from model              import SLRModel, freeze_stages, load_backbone
+from model_alternative   import KerasStyleSLRModel as SLRModel, freeze_stages, load_backbone
 import data_google_asl
 import data_sgsl
 from checkpoint_manager import CheckpointManager, EarlyStopping
 from data_augmentation import SignAugmentor
+from AWP import AWP
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +79,7 @@ def train(args):
     print(f"  Save dir  : {args.save_dir}")
     print(f"{'='*55}\n")
 
-    augmentor = SignAugmentor(flip_prob=0.5,rotate_std=0.05,keep_ratio=0.7)
+    augmentor = SignAugmentor(flip_prob=0.5,rotate_std=0.2)
 
     match args.data:
         case "sgsl":
@@ -81,7 +87,8 @@ def train(args):
                 batch_size=args.batch_size,
                 max_seq_len=128,
                 num_workers=args.num_workers,
-                augmentor=augmentor
+                augmentor=augmentor,
+                n_aug_per_sample=args.n_aug_val,
             )
         case "google_asl":
             # Data
@@ -100,22 +107,40 @@ def train(args):
     if args.stoch_drop:
         start_prob = 0.95
         end_prob = 0.2
-    model = SLRModel(num_classes=num_classes, stochastic_drop_start_prob=start_prob, stochastic_drop_end_prob=end_prob).to(device)
+    #model = SLRModel(num_classes=num_classes, stochastic_drop_start_prob=start_prob, stochastic_drop_end_prob=end_prob).to(device)
+    model = SLRModel(input_dim=134,num_classes=num_classes).to(device)
+
     print(f"  Params    : {sum(p.numel() for p in model.parameters()):,}\n")
 
+    if args.finetune_from and not args.resume:
+        best_pt = Path(args.finetune_from) / "best.pt"
+        if not best_pt.exists():
+            raise FileNotFoundError(f"No checkpoint found at {best_pt}")
+        load_backbone(model, str(best_pt), device=device)
+        if args.freeze_stages > 0:
+            freeze_stages(model, args.freeze_stages)
+
     # Optimiser + scheduler
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
-    #optimizer = torch.optim.Adam(
-    #    filter(lambda p: p.requires_grad, model.parameters()), 
-    #    lr=1e-3
-    #)
+    #optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    base_optimizer = optim_extra.RAdam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=4e-3,
+    )
+    optimizer = optim_extra.Lookahead(base_optimizer, k=5, alpha=0.5)
+
     steps_per_epoch = len(train_loader)
     total_steps = args.epochs * steps_per_epoch
     if args.scheduler == "onecyclelr":
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, 
-            max_lr=0.001, 
+            max_lr=6e-4, 
             total_steps=total_steps
+        )
+    elif args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=args.epochs, 
+            eta_min=1e-6
         )
     else:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -125,7 +150,8 @@ def train(args):
 
     # Checkpointing + early stopping
     ckpt = CheckpointManager(args.save_dir, metric_name="val_f1", verbose=False)
-    es = EarlyStopping(patience=20, mode="min")
+    if args.es:
+        es = EarlyStopping(patience=20, mode="min")
 
     log_path = Path(args.save_dir) / "history.csv"
     
@@ -136,11 +162,14 @@ def train(args):
     
     print(f"{'='*55}\n")
 
+    if args.awp:
+        awp = AWP(model, optimizer, criterion, lambda_=0.2, start_epoch=15)
 
     start_epoch, best_f1 = 0, 0.0
     if args.resume and ckpt.has_checkpoint():
-        start_epoch, best_f1 = ckpt.load_latest(model, optimizer, scheduler, device)
-        es.best = float("inf")
+        start_epoch, best_f1 = ckpt.load_latest(model, base_optimizer, scheduler, device)
+        if args.es:
+            es.best = float("inf")
         print(f"  Resumed from epoch {start_epoch},  best val_f1={best_f1:.4f}\n")
 
     # ---- Training loop ---------------------------------------------------
@@ -165,6 +194,8 @@ def train(args):
             loss   = criterion(logits, lbls)
             optimizer.zero_grad()
             loss.backward()
+            if args.awp:
+                awp.step(seqs, masks, lbls, epoch)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             if args.scheduler == "onecyclelr":
@@ -195,15 +226,17 @@ def train(args):
 
         if args.scheduler == "reduceonplateau":
             scheduler.step(val_f1)
+        if args.scheduler == "cosine":
+            scheduler.step()
 
         # Checkpoint
         is_best = val_f1 > best_f1
         if is_best:
             best_f1 = val_f1
-        ckpt.save(epoch, model, optimizer, scheduler, val_f1, is_best=is_best,
+        ckpt.save(epoch, model, base_optimizer, scheduler, val_f1, is_best=is_best,
                   extra={"train_loss": train_loss, "val_loss": val_loss})
         
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = base_optimizer.param_groups[0]['lr']
         with open(log_path, "a") as f:
             f.write(f"{epoch},{train_loss:.6f},{train_f1:.6f},{val_loss:.6f},{val_f1:.6f},{current_lr:.2e}\n")
 
@@ -220,7 +253,7 @@ def train(args):
             f"{time.time()-t0:.1f}s" + (" ★" if is_best else "")
         )
 
-        if es.step(val_loss):
+        if args.es and es.step(val_loss):
             tqdm.write(f"\n  Early stopping at epoch {epoch+1}.")
             break
 
@@ -237,10 +270,14 @@ if __name__ == "__main__":
     p.add_argument("--data",            required=True, choices=["sgsl", "google_asl"])
     p.add_argument("--save_dir",        default="checkpoints/google_asl")
     p.add_argument("--resume",          action="store_true")
-    p.add_argument("--finetune_from",   type=str, default=None, help="Path to prev checkpoint folder")
+    p.add_argument("--finetune_from",  type=str, default=None)
+    p.add_argument("--freeze_stages",  type=int, default=0, choices=[0, 1, 2, 3, 4])
     p.add_argument("--epochs",          type=int,   default=50)
     p.add_argument("--batch_size",      type=int,   default=64)
     p.add_argument("--num_workers",     type=int,   default=4)
-    p.add_argument("--scheduler",       type=str,   default="reduceonplateau", choices=["onecyclelr", "reduceonplateau"])
+    p.add_argument("--scheduler",       type=str,   default="reduceonplateau", choices=["onecyclelr", "reduceonplateau", "cosine"])
     p.add_argument("--stoch_drop",      action="store_true")
+    p.add_argument("--awp",             action="store_true")
+    p.add_argument("--es",              action="store_true")
+    p.add_argument("--n_aug_val",      type=int, default=3)
     train(p.parse_args())

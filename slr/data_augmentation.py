@@ -1,20 +1,33 @@
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-def temporal_mask(x, keep_ratio=0.7):
+def temporal_mask(x, ratio_range=(0.7, 1.3)):
     """
-    Randomly removes frames and stitches the remaining ones back together.
-    Ensures at least 50% of the clip remains.
+    Randomly scales the sequence length.
+    - Ratio < 1.0: Randomly drops frames (downsampling).
+    - Ratio > 1.0: Randomly duplicates frames (upsampling).
+    Ensures the structural integrity by keeping indices sorted.
     """
     T = x.shape[0]
+    # Pick a random ratio from the provided range
+    ratio = np.random.uniform(ratio_range[0], ratio_range[1])
+    n_target = int(T * ratio)
     
-    # Determine how many frames to keep
-    n_keep = int(T * np.random.uniform(keep_ratio, 1.0))
-    if n_keep >= T:
+    # Ensure we don't end up with 0 frames
+    n_target = max(1, n_target)
+
+    if n_target < T:
+        # Downsampling: Pick unique indices to keep
+        indices = np.sort(np.random.choice(np.arange(T), n_target, replace=False))
+    elif n_target > T:
+        # Upsampling: Pick indices with replacement to create duplicates
+        # We start with all indices to ensure every original frame exists at least once,
+        # then add extra random ones.
+        extra_indices = np.random.choice(np.arange(T), n_target - T, replace=True)
+        indices = np.sort(np.concatenate([np.arange(T), extra_indices]))
+    else:
         return x
-    
-    # Randomly select indices to keep (non-consecutive)
-    indices = np.sort(np.random.choice(np.arange(T), n_keep, replace=False))
+        
     return x[indices]
 
 def horizontal_flip(x, prob=0.5):
@@ -105,10 +118,10 @@ def rotate_hierarchical(x, rotate_std=0.05, smoothness=5.0):
     return x
 
 class SignAugmentor:
-    def __init__(self, flip_prob=0.5, rotate_std=0.05, keep_ratio=0.7, ik_std=0.03):
+    def __init__(self, flip_prob=0.5, rotate_std=0.05, temporal_ratio=(0.7,1.3), ik_std=0.03):
         self.flip_prob = flip_prob
         self.rotate_std = rotate_std
-        self.keep_ratio = keep_ratio
+        self.temporal_ratio = temporal_ratio
         self.ik_std = ik_std
 
     def __call__(self, x):
@@ -117,7 +130,7 @@ class SignAugmentor:
         x = x.reshape(T, 67, 2)
 
         # 1. Temporal Masking (Stitching frames)
-        x = temporal_mask(x, self.keep_ratio)
+        x = temporal_mask(x, self.temporal_ratio)
         
         # 2. Horizontal Flip
         x = horizontal_flip(x, self.flip_prob)

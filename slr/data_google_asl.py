@@ -200,7 +200,7 @@ def get_dataloaders(
     )
     val_ds = GoogleASLDataset(
         data_root, "val", val_fraction, max_seq_len,
-        label_map=train_ds.label_map, npy_dir=npy_dir, seed=seed, augmentor=augmentor
+        label_map=train_ds.label_map, npy_dir=npy_dir, seed=seed, augmentor=None
     )
 
     train_loader = DataLoader(
