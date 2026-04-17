@@ -117,12 +117,59 @@ def rotate_hierarchical(x, rotate_std=0.05, smoothness=5.0):
             
     return x
 
+def combinatorial_occlusion(x, prob=0.3):
+    """
+    Randomly zeros out combinations of body parts for the entire sequence.
+    Layout: [0:21 LH | 21:42 RH | 42:67 Pose]
+    
+    Pose Mapping (42-66):
+    - Face: 42-52
+    - Torso: 53, 54, 65, 66 (Shoulders & Hips)
+    - Arms: 55-64 (Elbows, Wrists, and Pose-version Fingers)
+    """
+    if np.random.rand() > prob:
+        return x
+    
+    x = x.copy()
+    
+    # Granular semantic groups
+    body_parts = {
+        "left_hand": slice(0, 21),
+        "right_hand": slice(21, 42),
+        "face": slice(42, 53),
+        "arms": slice(55, 65),  # Elbows (55,56), Wrists (57,58), Pose-Hands (59-64)
+        "torso": [53, 54, 65, 66] # Shoulders and Hips only
+    }
+
+    occlusion_happened = False
+    
+    for name, indices in body_parts.items():
+        # Using a ~20% chance for each group to disappear
+        if np.random.rand() < 0.20:
+            if isinstance(indices, list):
+                x[:, indices, :] = 0
+            else:
+                x[:, indices, :] = 0
+            occlusion_happened = True
+            
+    # Guarantee at least one occlusion if the function was triggered
+    if not occlusion_happened:
+        random_key = np.random.choice(list(body_parts.keys()))
+        target = body_parts[random_key]
+        if isinstance(target, list):
+            x[:, target, :] = 0
+        else:
+            x[:, target, :] = 0
+        
+    return x
+
 class SignAugmentor:
-    def __init__(self, flip_prob=0.5, rotate_std=0.05, temporal_ratio=(0.7,1.3), ik_std=0.03):
+    def __init__(self, flip_prob=0.5, rotate_std=0.05, temporal_ratio=(0.7,1.3), ik_std=0.03, occlusion_prob=0.3):
         self.flip_prob = flip_prob
         self.rotate_std = rotate_std
         self.temporal_ratio = temporal_ratio
         self.ik_std = ik_std
+        self.occlusion_prob = occlusion_prob
 
     def __call__(self, x):
         # x: (T, 134) -> (T, 67, 2)
@@ -137,6 +184,8 @@ class SignAugmentor:
         
         # 3. Hierarchical Rotation
         x = rotate_hierarchical(x, self.rotate_std)
+
+        x = combinatorial_occlusion(x, self.occlusion_prob)
 
         # Clean up NaNs and reshape back
         x = np.nan_to_num(x)

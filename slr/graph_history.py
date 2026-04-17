@@ -6,6 +6,8 @@ from pathlib import Path
 def plot_history(csv_paths):
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(22, 7))
     colors = plt.cm.tab10.colors 
+
+    temp_prefix = ["w/o Data Augmentations", "w/ Data Augmentations"]
     
     for i, path_str in enumerate(csv_paths):
         path = Path(path_str)
@@ -17,7 +19,8 @@ def plot_history(csv_paths):
         
         # --- FIX 1: Use parent folder name as label ---
         # e.g., 'experiments/v1_baseline/log.csv' -> 'v1_baseline'
-        label_prefix = path.parent.name if path.parent.name else path.stem
+        #label_prefix = path.parent.name if path.parent.name else path.stem
+        label_prefix = temp_prefix[i]
         color = colors[i % len(colors)]
 
         # --- Subplot 1: Loss ---

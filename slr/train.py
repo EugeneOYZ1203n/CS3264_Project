@@ -4,9 +4,7 @@ train.py  —  Simple training script for SLRModel
 Usage:
     python train.py --data_root ./asl-signs
     python train.py --data_root ./asl-signs --resume
-    python train.py --data sgsl --save_dir checkpoints/sgsl_ft
-                    --finetune_from checkpoints/google_asl
-                    --freeze_stages 2
+    python train.py --data sgsl --save_dir checkpoints/sgsl_ft --finetune_from checkpoints/google_asl --freeze_stages 3
 """
 
 import argparse
@@ -19,8 +17,8 @@ import torch_optimizer as optim_extra
 from sklearn.metrics    import f1_score
 from tqdm import tqdm
 
-#from model              import SLRModel, freeze_stages, load_backbone
-from model_alternative   import KerasStyleSLRModel as SLRModel, freeze_stages, load_backbone
+from model              import SLRModel, freeze_stages, load_backbone
+#from model_alternative   import KerasStyleSLRModel as SLRModel, freeze_stages, load_backbone
 import data_google_asl
 import data_sgsl
 from checkpoint_manager import CheckpointManager, EarlyStopping
@@ -71,7 +69,8 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
 # ---------------------------------------------------------------------------
 
 def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_type)
 
     print(f"\n{'='*55}")
     print(f"  Device    : {device}")
@@ -116,7 +115,7 @@ def train(args):
         best_pt = Path(args.finetune_from) / "best.pt"
         if not best_pt.exists():
             raise FileNotFoundError(f"No checkpoint found at {best_pt}")
-        load_backbone(model, str(best_pt), device=device)
+        load_backbone(model, str(best_pt), device=device, load_classifier=args.load_classifier)
         if args.freeze_stages > 0:
             freeze_stages(model, args.freeze_stages)
 
@@ -163,7 +162,10 @@ def train(args):
     print(f"{'='*55}\n")
 
     if args.awp:
-        awp = AWP(model, optimizer, criterion, lambda_=0.2, start_epoch=15)
+        awp = AWP(model, base_optimizer, adv_lr=0.001, adv_eps=0.001)
+        awp_start_epoch = 5
+
+    scaler = torch.amp.GradScaler(device=device, enabled=True, init_scale=4096)
 
     start_epoch, best_f1 = 0, 0.0
     if args.resume and ckpt.has_checkpoint():
@@ -190,14 +192,20 @@ def train(args):
         t_loss, t_preds, t_labels = 0.0, [], []
         for seqs, masks, lbls in train_bar:
             seqs, masks, lbls = seqs.to(device), masks.to(device), lbls.to(device)
-            logits = model(seqs, padding_mask=masks)
-            loss   = criterion(logits, lbls)
+            with torch.amp.autocast(device_type=device_type, dtype=torch.float16):
+                logits = model(seqs, padding_mask=masks)
+                loss   = criterion(logits, lbls)
             optimizer.zero_grad()
-            loss.backward()
             if args.awp:
-                awp.step(seqs, masks, lbls, epoch)
+                if epoch >= awp_start_epoch:
+                    awp.perturb(seqs, masks, lbls, criterion, scaler)
+            scaler.scale(loss).backward()
+            if args.awp:
+                awp.restore()
+            scaler.unscale_(optimizer) # Unscale for gradient clipping
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             if args.scheduler == "onecyclelr":
                 scheduler.step()
             t_loss  += loss.item() * len(lbls)
@@ -279,5 +287,6 @@ if __name__ == "__main__":
     p.add_argument("--stoch_drop",      action="store_true")
     p.add_argument("--awp",             action="store_true")
     p.add_argument("--es",              action="store_true")
+    p.add_argument("--load_classifier",      action="store_true")
     p.add_argument("--n_aug_val",      type=int, default=3)
     train(p.parse_args())

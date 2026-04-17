@@ -15,7 +15,8 @@ class SLRModel(nn.Module):
         n_attn_layers=4, 
         dropout=0.1,
         stochastic_drop_start_prob = 1.0,
-        stochastic_drop_end_prob = 1.0
+        stochastic_drop_end_prob = 1.0,
+        feature_extract=False
     ):
         super().__init__()
 
@@ -27,8 +28,10 @@ class SLRModel(nn.Module):
             total_residual_layers
         ).tolist()
 
-        self.extractor = PoseFeatureExtractor()
-        input_dim += 4
+        self.feature_extract = feature_extract
+        if self.feature_extract:
+            self.extractor = PoseFeatureExtractor()
+            input_dim += 4
 
         # --- Stage 1 & 3: Temporal Convolutions ---
         s1_probs = probs[:4]
@@ -182,7 +185,8 @@ class SLRModel(nn.Module):
         }
 
     def forward(self, x, padding_mask=None):
-        x = self.extractor(x)
+        if self.feature_extract:
+            x = self.extractor(x)
 
         # Stage 1: Temporal patterns per feature
         s1 = self.run_stage1(x)
@@ -218,21 +222,25 @@ class SLRModel(nn.Module):
 _STAGE_ORDER = ["stage1", "stage2", "stage3", "stage4", "stage5"]
  
  
-def load_backbone(model: SLRModel, checkpoint_path: str, device="cpu"):
+def load_backbone(model: SLRModel, checkpoint_path: str, device="cpu", load_classifier=False):
     """
     Load all weights from a checkpoint except the classifier head.
     The new model can have a different num_classes.
     """
     ckpt       = torch.load(checkpoint_path, map_location=device)
     state_dict = ckpt["model_state_dict"]
-    backbone   = {k: v for k, v in state_dict.items() if "classifier" not in k}
+    if not load_classifier:
+        backbone   = {k: v for k, v in state_dict.items() if "classifier" not in k}
+    else:
+        backbone   = {k: v for k, v in state_dict.items()}
     missing, unexpected = model.load_state_dict(backbone, strict=False)
     print(f"  Backbone loaded from '{checkpoint_path}'")
     if missing:
         print(f"    Missing keys  : {missing}")
     if unexpected:
         print(f"    Unexpected    : {unexpected}")
-    print(f"  Classifier head ({model.classifier.out_features} classes) initialised fresh.")
+    if not load_classifier:
+        print(f"  Classifier head ({model.classifier.out_features} classes) initialised fresh.")
  
  
 def freeze_stages(model: SLRModel, freeze_up_to: int):

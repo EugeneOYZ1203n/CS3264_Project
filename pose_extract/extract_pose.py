@@ -206,7 +206,7 @@ def build_pose(frames, results_list, fps):
             limbs=[],
             # colors must have the same length as limbs; empty limbs → one
             # placeholder colour so the list is never completely absent
-            colors=[(128, 128, 128)],
+            colors=[(128, 128, 128)], 
             # 'XYZC' → num_dims() = len("XYZC") - 1 = 3, which matches our
             # (T, 1, N, 3) data arrays.  'XYZ' would give 2 and cause the
             # write() sanity-check to raise, producing a corrupt file.
